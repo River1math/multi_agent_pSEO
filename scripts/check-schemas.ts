@@ -5,21 +5,21 @@
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { z } from "zod";
 import {
-  AlternativesPageDataSchema,
-  BestForPageDataSchema,
   DraftContentSchema,
+  KeywordDedupSchema,
   KeywordExpansionSchema,
+  llmPageDataSchemaFor,
   LlmQaReportSchema,
   ToolFactSheetSchema,
-  VersusPageDataSchema,
 } from "../src/schemas";
 
 const llmFacing: Record<string, z.ZodType> = {
   "keyword.expansion": KeywordExpansionSchema,
+  "keyword.dedup": KeywordDedupSchema,
   "extractor.factSheet": ToolFactSheetSchema,
-  "extractor.pageData.versus": VersusPageDataSchema,
-  "extractor.pageData.best_for": BestForPageDataSchema,
-  "extractor.pageData.alternatives": AlternativesPageDataSchema,
+  "extractor.pageData.versus": llmPageDataSchemaFor.versus,
+  "extractor.pageData.best_for": llmPageDataSchemaFor.best_for,
+  "extractor.pageData.alternatives": llmPageDataSchemaFor.alternatives,
   "drafter.content": DraftContentSchema,
   "gatekeeper.report": LlmQaReportSchema,
 };

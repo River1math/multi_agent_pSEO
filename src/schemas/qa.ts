@@ -58,6 +58,11 @@ export const DeterministicSignalsSchema = z.object({
   /** Highest shingle Jaccard similarity of the prose against any sibling page (0–1). */
   maxSiblingSimilarity: z.number().min(0).max(1),
   nearestSiblingSlug: SlugSchema.nullable(),
+  /**
+   * Blocks whose wording is at least 80% contained in one sibling page. Page-level Jaccard
+   * under-reads a page that copies a few sections of a longer sibling; this does not.
+   */
+  copiedBlocks: z.array(z.object({ blockId: RefIdSchema, siblingSlug: SlugSchema, share: z.number().min(0).max(1) })),
   /** Numbers / prices in the copy that appear nowhere in the page data or fact sheets. */
   unsupportedNumbers: z.array(z.string()),
   /** dataRefs / faqIds that do not resolve. */
@@ -90,6 +95,10 @@ export type QaResult = z.infer<typeof QaResultSchema>;
 const SIMILARITY_FREE = 0.25;
 const SIMILARITY_CEILING = 0.6;
 
+/** Any copied block holds uniqueness below the dimension floor, so the page cannot pass. */
+const COPIED_BLOCK_CAP = 60;
+export const COPIED_BLOCK_SHARE = 0.8;
+
 function similarityCap(similarity: number): number {
   if (similarity <= SIMILARITY_FREE) return 100;
   if (similarity >= SIMILARITY_CEILING) return 0;
@@ -107,8 +116,8 @@ export function scoreQa(
   attempt: number,
 ): QaResult {
   const issues: QaIssue[] = [...report.issues];
-  const codeBlocker = (dimension: QaDimension, problem: string, fixInstruction: string) =>
-    issues.push({ dimension, severity: "blocker", blockId: null, quote: null, problem, fixInstruction });
+  const codeBlocker = (dimension: QaDimension, problem: string, fixInstruction: string, blockId: string | null = null) =>
+    issues.push({ dimension, severity: "blocker", blockId, quote: null, problem, fixInstruction });
 
   if (signals.unsupportedNumbers.length > 0) {
     codeBlocker(
@@ -127,18 +136,39 @@ export function scoreQa(
   if (signals.titleCollision) {
     codeBlocker("uniqueness", "Title duplicates a sibling page.", "Write a title specific to this page.");
   }
-  if (signals.maxSiblingSimilarity >= SIMILARITY_CEILING) {
+  if (signals.maxSiblingSimilarity > SIMILARITY_FREE) {
+    issues.push({
+      dimension: "uniqueness",
+      severity: signals.maxSiblingSimilarity >= SIMILARITY_CEILING ? "blocker" : "major",
+      blockId: null,
+      quote: null,
+      problem: `Prose is ${Math.round(signals.maxSiblingSimilarity * 100)}% similar to ${signals.nearestSiblingSlug ?? "a sibling"} (product names masked).`,
+      fixInstruction: "Restructure around this page's own key differences instead of sentences shared with the sibling.",
+    });
+  }
+
+  for (const copied of signals.copiedBlocks) {
+    // The model usually reports these too; only add what it missed.
+    const reported = report.issues.some(
+      (issue) => issue.blockId === copied.blockId && issue.dimension === "uniqueness" && issue.severity === "blocker",
+    );
+    if (reported) continue;
     codeBlocker(
       "uniqueness",
-      `Prose is ${Math.round(signals.maxSiblingSimilarity * 100)}% similar to ${signals.nearestSiblingSlug ?? "a sibling"}.`,
-      "Restructure around this page's own key differences instead of the shared frame.",
+      `${Math.round(copied.share * 100)}% of this block's wording is on ${copied.siblingSlug}.`,
+      "Rewrite the block from this page's own data instead of reusing the sibling's sentences.",
+      copied.blockId,
     );
   }
 
   const factPenalty = signals.unsupportedNumbers.length > 0 || signals.danglingRefs.length > 0 ? 60 : 100;
   const dimensions = {
     informationGain: Math.max(0, report.informationGain.score - 5 * signals.boilerplateHits.length),
-    uniqueness: Math.min(report.uniqueness.score, similarityCap(signals.maxSiblingSimilarity)),
+    uniqueness: Math.min(
+      report.uniqueness.score,
+      similarityCap(signals.maxSiblingSimilarity),
+      signals.copiedBlocks.length > 0 ? COPIED_BLOCK_CAP : 100,
+    ),
     factConsistency: Math.min(report.factConsistency.score, factPenalty),
   };
 
@@ -147,6 +177,20 @@ export function scoreQa(
       dimensions.uniqueness * RUBRIC_WEIGHTS.uniqueness +
       dimensions.factConsistency * RUBRIC_WEIGHTS.factConsistency,
   );
+
+  // A rejection must always tell the writer what to change. If a dimension falls short and
+  // nothing above explains it, the model's own rationale for that score becomes the issue.
+  for (const dimension of QaDimensionSchema.options) {
+    if (dimensions[dimension] >= QA_PASS_THRESHOLD || issues.some((issue) => issue.dimension === dimension)) continue;
+    issues.push({
+      dimension,
+      severity: "major",
+      blockId: null,
+      quote: null,
+      problem: `${dimension} scored ${dimensions[dimension]}: ${report[dimension].rationale}`.slice(0, 280),
+      fixInstruction: "Address the stated weakness across the page; no single block was singled out.",
+    });
+  }
 
   const passed =
     total >= QA_PASS_THRESHOLD &&

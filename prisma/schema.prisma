@@ -3,8 +3,10 @@ generator client {
   output   = "../src/generated/prisma"
 }
 
+// SQLite for local and sandbox runs. The schema avoids provider-specific types (list columns are
+// Json) so that moving to Postgres is a provider change here plus the adapter in src/db/client.ts.
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
 }
 
 // ───────────────────────────── Enums ─────────────────────────────
@@ -117,7 +119,7 @@ model Keyword {
   canonicalKey  String
   pageType      PageType
   intent        SearchIntent
-  entitySlugs   String[]
+  entitySlugs   Json
   categorySlug  String? // software category ranked on a BEST_FOR page
   modifier      String? // niche / audience qualifier for BEST_FOR
   priority      Float         @default(0) // 0–100, computed in code from signals
@@ -147,7 +149,7 @@ model Entity {
   name       String
   websiteUrl String?
   category   String
-  aliases    String[]
+  aliases    Json
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -233,7 +235,7 @@ model Page {
 
   // Uniqueness fingerprint, compared against sibling pages by the gatekeeper.
   contentHash String?
-  minhash     Int[]
+  minhash     Json?
   wordCount   Int?
 
   // Worker lease: the page row is the job. Claimed with FOR UPDATE SKIP LOCKED.
@@ -310,6 +312,8 @@ model QaEvaluation {
   verdict         QaVerdict
   /// LlmQaReport (Zod): per-dimension rationale + issues with fix instructions.
   llmReport       Json
+  /// QaIssue[] (Zod): the model's issues plus code-raised blockers; the next revision's critique.
+  issues          Json
   /// DeterministicSignals (Zod): sibling similarity, unsupported numbers, dangling refs.
   signals         Json
   model           String
@@ -330,7 +334,7 @@ model InternalLink {
   score      Float
   anchorText String
   /// Why the two pages are related (shared entity / tag slugs), for debugging and audits.
-  sharedKeys String[]
+  sharedKeys Json
 
   from Page @relation("LinkFrom", fields: [fromPageId], references: [id], onDelete: Cascade)
   to   Page @relation("LinkTo", fields: [toPageId], references: [id], onDelete: Cascade)
@@ -361,7 +365,7 @@ model AgentCall {
   outputTokens     Int
   cacheReadTokens  Int       @default(0)
   cacheWriteTokens Int       @default(0)
-  costUsd          Decimal   @db.Decimal(10, 6)
+  costUsd          Float
   latencyMs        Int
   stopReason       String?
   retries          Int       @default(0)

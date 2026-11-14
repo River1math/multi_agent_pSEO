@@ -161,8 +161,23 @@ export const pageDataSchemaFor = {
   alternatives: AlternativesPageDataSchema,
 } as const;
 
+/**
+ * What the Extractor's model call returns: everything except cost scenarios, which are arithmetic
+ * over pricing tiers and are therefore computed in code.
+ */
+export const llmPageDataSchemaFor = {
+  versus: VersusPageDataSchema.omit({ costScenarios: true }),
+  best_for: BestForPageDataSchema.omit({ costScenarios: true }),
+  alternatives: AlternativesPageDataSchema.omit({ costScenarios: true }),
+} as const;
+
+export type LlmPageData =
+  | z.infer<(typeof llmPageDataSchemaFor)["versus"]>
+  | z.infer<(typeof llmPageDataSchemaFor)["best_for"]>
+  | z.infer<(typeof llmPageDataSchemaFor)["alternatives"]>;
+
 /** Entities a page covers, in display order. */
-export function entitySlugsOf(data: PageData): string[] {
+export function entitySlugsOf(data: PageData | LlmPageData): string[] {
   switch (data.pageType) {
     case "versus":
       return [...data.entitySlugs];

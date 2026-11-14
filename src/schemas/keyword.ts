@@ -66,7 +66,15 @@ export const QueuedKeywordSchema = KeywordCandidateSchema.extend({
 
 export const KeywordAgentOutputSchema = z.object({
   queued: z.array(QueuedKeywordSchema),
-  duplicates: z.array(z.object({ phrase: z.string(), duplicateOfKey: z.string() })),
+  duplicates: z.array(
+    z.object({
+      candidate: QueuedKeywordSchema,
+      duplicateOfKey: z.string(),
+      detectedBy: z.enum(["canonical_key", "model"]),
+      reason: z.string(),
+    }),
+  ),
+  skipped: z.array(z.object({ phrase: z.string(), reason: z.string() })),
 });
 
 const normalizeModifier = (modifier: string): string =>
@@ -102,3 +110,22 @@ export type KeywordCandidate = z.infer<typeof KeywordCandidateSchema>;
 export type KeywordAgentInput = z.infer<typeof KeywordAgentInputSchema>;
 export type QueuedKeyword = z.infer<typeof QueuedKeywordSchema>;
 export type KeywordAgentOutput = z.infer<typeof KeywordAgentOutputSchema>;
+
+/** Second pass: the model flags near-duplicates that canonical keys cannot catch. */
+export const KeywordDedupSchema = z.object({
+  duplicates: z.array(
+    z.object({
+      canonicalKey: z.string().describe("The redundant keyword"),
+      duplicateOfKey: z.string().describe("The keyword to keep; it must have equal or higher priority"),
+      reason: z.string().max(200),
+    }),
+  ),
+});
+
+export const KeywordDedupInputSchema = z.object({
+  candidates: z.array(z.object({ canonicalKey: z.string(), phrase: z.string(), priority: z.number() })),
+  alreadyQueued: z.array(z.object({ canonicalKey: z.string(), phrase: z.string() })),
+});
+
+export type KeywordDedup = z.infer<typeof KeywordDedupSchema>;
+export type KeywordDedupInput = z.infer<typeof KeywordDedupInputSchema>;
