@@ -4,5 +4,6 @@ node_modules/
 .env.local
 src/generated/
 *.tsbuildinfo
+next-env.d.ts
 prisma/dry-run/
 prisma/*.db
