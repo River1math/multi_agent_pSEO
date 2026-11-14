@@ -1,0 +1,376 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum PageType {
+  VERSUS // "[Tool A] vs [Tool B]"
+  BEST_FOR // "Best [Software] for [Niche]"
+  ALTERNATIVES // "[Tool] alternatives"
+}
+
+enum SearchIntent {
+  INFORMATIONAL
+  COMMERCIAL
+  TRANSACTIONAL
+  NAVIGATIONAL
+}
+
+enum KeywordStatus {
+  QUEUED
+  CLAIMED
+  COMPLETED
+  DUPLICATE // semantic duplicate of duplicateOf
+  SKIPPED // unresolvable entities, off-vertical, etc.
+}
+
+/// Page state machine. Only PUBLISHED pages are routable, in the sitemap, or link targets.
+enum PageStatus {
+  QUEUED
+  EXTRACTING
+  DRAFTING
+  IN_QA
+  REVISING
+  APPROVED // passed the gate, waiting for the publish step (drip scheduling, link graph)
+  PUBLISHED
+  NEEDS_HUMAN_REVIEW // failed the gate after max revisions
+  FAILED // non-retryable pipeline error
+  ARCHIVED
+}
+
+enum EntityRole {
+  PRIMARY // named in the keyword
+  CANDIDATE // selected by the pipeline (e.g. ranked items on a BEST_FOR page)
+}
+
+enum SourceKind {
+  PRICING_PAGE
+  DOCS
+  CHANGELOG
+  HOMEPAGE
+  THIRD_PARTY
+}
+
+enum TagKind {
+  CATEGORY
+  USE_CASE
+  FEATURE
+  AUDIENCE
+}
+
+enum AgentName {
+  KEYWORD
+  EXTRACTOR
+  DRAFTER
+  GATEKEEPER
+}
+
+enum QaVerdict {
+  PASS
+  REVISE
+  HUMAN_REVIEW
+}
+
+// ─────────────────────── Vertical & keyword queue ───────────────────────
+
+model Vertical {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  /// Key into the vertical schema registry (selects the fact-sheet Zod schema + feature taxonomy).
+  schemaKey String
+  createdAt DateTime @default(now())
+
+  seedTopics SeedTopic[]
+  keywords   Keyword[]
+  entities   Entity[]
+  pages      Page[]
+}
+
+model SeedTopic {
+  id         String    @id @default(cuid())
+  verticalId String
+  topic      String
+  expandedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  vertical Vertical  @relation(fields: [verticalId], references: [id], onDelete: Cascade)
+  keywords Keyword[]
+
+  @@unique([verticalId, topic])
+}
+
+model Keyword {
+  id            String        @id @default(cuid())
+  verticalId    String
+  seedTopicId   String?
+  phrase        String
+  /// Order-insensitive semantic identity, computed in code (never by the LLM), e.g.
+  /// "versus:cursor|github-copilot". The unique constraint is the first dedup layer and
+  /// what makes keyword upserts idempotent.
+  canonicalKey  String
+  pageType      PageType
+  intent        SearchIntent
+  entitySlugs   String[]
+  categorySlug  String? // software category ranked on a BEST_FOR page
+  modifier      String? // niche / audience qualifier for BEST_FOR
+  priority      Float         @default(0) // 0–100, computed in code from signals
+  /// KeywordSignals (Zod): demand tier, competition, commercial value, expected SERP features.
+  signals       Json
+  status        KeywordStatus @default(QUEUED)
+  duplicateOfId String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  vertical    Vertical   @relation(fields: [verticalId], references: [id], onDelete: Cascade)
+  seedTopic   SeedTopic? @relation(fields: [seedTopicId], references: [id], onDelete: SetNull)
+  duplicateOf Keyword?   @relation("KeywordDuplicates", fields: [duplicateOfId], references: [id], onDelete: SetNull)
+  duplicates  Keyword[]  @relation("KeywordDuplicates")
+  page        Page?
+
+  @@unique([verticalId, canonicalKey])
+  @@index([status, priority(sort: Desc)])
+}
+
+// ─────────────────────── Entities & sourced facts ───────────────────────
+
+model Entity {
+  id         String   @id @default(cuid())
+  verticalId String
+  slug       String
+  name       String
+  websiteUrl String?
+  category   String
+  aliases    String[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  vertical   Vertical          @relation(fields: [verticalId], references: [id], onDelete: Cascade)
+  factSheets EntityFactSheet[]
+  sources    SourceDocument[]
+  pages      PageEntity[]
+  tags       Tag[]
+
+  @@unique([verticalId, slug])
+}
+
+/// Immutable, versioned fact sheet per entity. Facts are extracted once per entity and reused by
+/// every page that mentions it, so "Cursor Pro costs $X" cannot differ between sibling pages.
+model EntityFactSheet {
+  id            String   @id @default(cuid())
+  entityId      String
+  version       Int
+  schemaVersion Int
+  /// ToolFactSheet (Zod) for the default vertical.
+  data          Json
+  contentHash   String
+  isCurrent     Boolean  @default(false)
+  model         String
+  extractedAt   DateTime @default(now())
+
+  entity Entity       @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  usedBy PageEntity[]
+
+  @@unique([entityId, version])
+  @@unique([entityId, contentHash]) // re-extracting unchanged facts is a no-op
+  @@index([entityId, isCurrent])
+}
+
+/// Evidence the extractor is grounded on. Facts cite a source URL; uncited facts are "inferred".
+model SourceDocument {
+  id          String     @id @default(cuid())
+  entityId    String
+  url         String
+  kind        SourceKind
+  contentHash String
+  content     String
+  httpStatus  Int?
+  fetchedAt   DateTime   @default(now())
+
+  entity Entity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@unique([entityId, url, contentHash])
+}
+
+model Tag {
+  id    String  @id @default(cuid())
+  slug  String  @unique
+  label String
+  kind  TagKind
+
+  entities Entity[]
+  pages    Page[]
+}
+
+// ───────────────────────────── Pages ─────────────────────────────
+
+model Page {
+  id         String     @id @default(cuid())
+  verticalId String
+  keywordId  String     @unique
+  slug       String     @unique
+  pageType   PageType
+  status     PageStatus @default(QUEUED)
+
+  // Denormalized from the approved draft for metadata, sitemap and link anchors.
+  title           String?
+  metaDescription String?
+
+  /// PageData (Zod discriminated union on pageType): matrix, verdicts, FAQs, cost scenarios.
+  structuredData Json?
+  schemaVersion  Int   @default(1)
+  /// DraftContent (Zod) snapshot of the approved draft; what the template renders.
+  content        Json?
+
+  qaScore       Int?
+  revisionCount Int  @default(0)
+
+  // Uniqueness fingerprint, compared against sibling pages by the gatekeeper.
+  contentHash String?
+  minhash     Int[]
+  wordCount   Int?
+
+  // Worker lease: the page row is the job. Claimed with FOR UPDATE SKIP LOCKED.
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  attempts       Int       @default(0)
+  nextAttemptAt  DateTime  @default(now())
+  lastError      String?
+
+  publishedAt      DateTime?
+  /// Bumped only when rendered content actually changes; drives sitemap <lastmod>.
+  contentUpdatedAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  vertical    Vertical       @relation(fields: [verticalId], references: [id], onDelete: Cascade)
+  keyword     Keyword        @relation(fields: [keywordId], references: [id], onDelete: Cascade)
+  entities    PageEntity[]
+  tags        Tag[]
+  drafts      Draft[]
+  evaluations QaEvaluation[]
+  linksOut    InternalLink[] @relation("LinkFrom")
+  linksIn     InternalLink[] @relation("LinkTo")
+  agentCalls  AgentCall[]
+
+  @@index([status, nextAttemptAt])
+  @@index([status, publishedAt(sort: Desc)])
+  @@index([verticalId, pageType, status])
+}
+
+model PageEntity {
+  pageId      String
+  entityId    String
+  role        EntityRole
+  position    Int
+  /// Fact sheet version this page was built from. A newer current sheet marks the page stale.
+  factSheetId String?
+
+  page      Page             @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  entity    Entity           @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  factSheet EntityFactSheet? @relation(fields: [factSheetId], references: [id], onDelete: SetNull)
+
+  @@id([pageId, entityId])
+  @@index([entityId])
+}
+
+/// One row per drafting attempt: 0 = first draft, 1..2 = critique-driven revisions.
+model Draft {
+  id        String   @id @default(cuid())
+  pageId    String
+  attempt   Int
+  /// DraftContent (Zod).
+  content   Json
+  /// Hash of (structuredData, fact sheet versions, critique). Same inputs → reuse, no new LLM call.
+  inputHash String
+  model     String
+  createdAt DateTime @default(now())
+
+  page       Page          @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  evaluation QaEvaluation?
+
+  @@unique([pageId, attempt])
+}
+
+model QaEvaluation {
+  id              String    @id @default(cuid())
+  pageId          String
+  draftId         String    @unique
+  rubricVersion   Int
+  totalScore      Int
+  informationGain Int
+  uniqueness      Int
+  factConsistency Int
+  verdict         QaVerdict
+  /// LlmQaReport (Zod): per-dimension rationale + issues with fix instructions.
+  llmReport       Json
+  /// DeterministicSignals (Zod): sibling similarity, unsupported numbers, dangling refs.
+  signals         Json
+  model           String
+  createdAt       DateTime  @default(now())
+
+  page  Page  @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  draft Draft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@index([pageId, createdAt])
+  @@index([verdict])
+}
+
+/// Materialized link graph between PUBLISHED pages, recomputed by the publish step.
+model InternalLink {
+  fromPageId String
+  toPageId   String
+  rank       Int
+  score      Float
+  anchorText String
+  /// Why the two pages are related (shared entity / tag slugs), for debugging and audits.
+  sharedKeys String[]
+
+  from Page @relation("LinkFrom", fields: [fromPageId], references: [id], onDelete: Cascade)
+  to   Page @relation("LinkTo", fields: [toPageId], references: [id], onDelete: Cascade)
+
+  @@id([fromPageId, toPageId])
+  @@index([toPageId])
+}
+
+// ───────────────────────── Runs & cost ledger ─────────────────────────
+
+model PipelineRun {
+  id         String    @id @default(cuid())
+  dryRun     Boolean   @default(false)
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  stats      Json?
+
+  agentCalls AgentCall[]
+}
+
+model AgentCall {
+  id               String    @id @default(cuid())
+  runId            String?
+  pageId           String?
+  agent            AgentName
+  model            String
+  inputTokens      Int
+  outputTokens     Int
+  cacheReadTokens  Int       @default(0)
+  cacheWriteTokens Int       @default(0)
+  costUsd          Decimal   @db.Decimal(10, 6)
+  latencyMs        Int
+  stopReason       String?
+  retries          Int       @default(0)
+  error            String?
+  createdAt        DateTime  @default(now())
+
+  run  PipelineRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  page Page?        @relation(fields: [pageId], references: [id], onDelete: SetNull)
+
+  @@index([runId])
+  @@index([agent, createdAt])
+}
